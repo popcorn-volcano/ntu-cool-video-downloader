@@ -2,3 +2,6 @@ token.txt
 downloads/
 *.part
 __pycache__/
+build/
+dist/
+*.spec

@@ -1,0 +1,52 @@
+name: Build release
+
+# Push a tag like v1.2.0 to build the Windows / macOS apps and publish a GitHub Release.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            asset: NTU-COOL-Downloader-Windows.exe
+          - os: macos-latest
+            asset: NTU-COOL-Downloader-macOS.zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt pyinstaller
+      - run: pyinstaller --onefile --console --name NTU-COOL-Downloader ntu_cool_dl.py
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        run: Move-Item dist/NTU-COOL-Downloader.exe ${{ matrix.asset }}
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: cd dist && zip -X ../${{ matrix.asset }} NTU-COOL-Downloader
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            NTU-COOL-Downloader-Windows.exe
+            NTU-COOL-Downloader-macOS.zip
