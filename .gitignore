@@ -1,0 +1,4 @@
+token.txt
+downloads/
+*.part
+__pycache__/
