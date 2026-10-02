@@ -21,7 +21,7 @@ from pathlib import Path
 
 import requests
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 CANVAS = "https://cool.ntu.edu.tw"
 VIDEO_HOST = "cool-video.dlc.ntu.edu.tw"
@@ -60,8 +60,8 @@ def ask_token():
     print()
     print("第一次使用需要 NTU COOL 存取權杖 (Access Token)。First run: an NTU COOL access token is needed.")
     print("  1. 在開啟的網頁登入 NTU COOL（設定頁面）")
-    print("  2. 往下找到「已核准的整合 Approved Integrations」，按「+ 新增存取權杖 / + New Access Token」")
-    print("  3. 用途隨便填（例如 video），按「產生權杖」，複製那串很長的權杖")
+    print("  2. 往下找到「已核准的整合 Approved Integrations」，按「新訪問令牌 / + New Access Token」")
+    print("  3. 「目的」隨便填（例如 video），按「產生憑證」，複製那串很長的權杖")
     print(f"  (網址 URL: {TOKEN_PAGE})")
     try:
         webbrowser.open(TOKEN_PAGE)
