@@ -12,20 +12,20 @@ or a single video link (https://cool.ntu.edu.tw/courses/67065/modules/items/2682
 import argparse
 import html.parser
 import os
+import json
 import re
 import shutil
 import subprocess
 import sys
-import webbrowser
+import time
 from pathlib import Path
 
 import requests
 
-__version__ = "1.1.1"
+__version__ = "1.2.0"
 
 CANVAS = "https://cool.ntu.edu.tw"
 VIDEO_HOST = "cool-video.dlc.ntu.edu.tw"
-TOKEN_PAGE = CANVAS + "/profile/settings"
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130 Safari/537.36"
 
 
@@ -33,52 +33,110 @@ class UserError(Exception):
     """An error with a message meant for the user (no traceback)."""
 
 
-# ---------- token storage ----------
+class AuthError(UserError):
+    """Not logged in, or the login has expired."""
+
+
+# ---------- login (browser window) ----------
 
 def config_dir():
     base = os.environ.get("APPDATA") if os.name == "nt" else os.environ.get("XDG_CONFIG_HOME")
     return Path(base or Path.home() / ".config") / "ntu-cool-dl"
 
 
-def token_file():
-    return config_dir() / "token.txt"
+def cookies_file():
+    return config_dir() / "session.json"
 
 
-def saved_token():
-    if os.environ.get("NTU_COOL_TOKEN"):
-        return os.environ["NTU_COOL_TOKEN"].strip()
-    f = token_file()
-    return f.read_text(encoding="utf-8").strip() if f.exists() else None
-
-
-def save_token(token):
-    config_dir().mkdir(parents=True, exist_ok=True)
-    token_file().write_text(token, encoding="utf-8")
-
-
-def ask_token():
-    print()
-    print("第一次使用需要 NTU COOL 存取權杖 (Access Token)。First run: an NTU COOL access token is needed.")
-    print("  1. 在開啟的網頁登入 NTU COOL（設定頁面）")
-    print("  2. 往下找到「已核准的整合 Approved Integrations」，按「新訪問令牌 / + New Access Token」")
-    print("  3. 「目的」隨便填（例如 video），按「產生憑證」，複製那串很長的權杖")
-    print(f"  (網址 URL: {TOKEN_PAGE})")
+def saved_cookies():
+    f = cookies_file()
+    if not f.exists():
+        return None
     try:
-        webbrowser.open(TOKEN_PAGE)
-    except Exception:
-        pass
-    token = input("\n貼上權杖後按 Enter / Paste token and press Enter: ").strip()
-    if not token:
-        raise UserError("沒有輸入權杖。No token entered.")
-    return token
+        return json.loads(f.read_text(encoding="utf-8"))
+    except ValueError:
+        return None
+
+
+def save_cookies(cookies):
+    config_dir().mkdir(parents=True, exist_ok=True)
+    cookies_file().write_text(json.dumps(cookies), encoding="utf-8")
+
+
+def browser_login():
+    """Open Edge/Chrome so the user signs in to NTU COOL normally; return its cookies."""
+    try:
+        from playwright.sync_api import Error as PWError, sync_playwright
+    except ImportError:
+        raise UserError("缺少 playwright 套件，請執行 pip install playwright。Missing playwright: pip install playwright")
+
+    print()
+    print("即將開啟瀏覽器視窗，請用你的 NTU 帳號登入 NTU COOL。")
+    print("A browser window will open. Sign in to NTU COOL with your NTU account.")
+    print("登入完成後視窗會自動關閉。The window closes by itself after you sign in.")
+
+    channels = ["msedge", "chrome"] if os.name == "nt" else ["chrome", "msedge"]
+    with sync_playwright() as p:
+        ctx = None
+        for ch in channels:
+            try:
+                ctx = p.chromium.launch_persistent_context(
+                    str(config_dir() / "browser"), channel=ch, headless=False, no_viewport=True)
+                break
+            except PWError:
+                continue
+        if ctx is None:
+            raise UserError("找不到 Microsoft Edge 或 Google Chrome，請先安裝 Google Chrome：https://www.google.com/chrome/\n"
+                            "  Neither Edge nor Chrome was found. Please install Google Chrome.")
+        closed = UserError("登入視窗被關閉了，請重新執行並完成登入。The login window was closed before signing in.")
+        try:
+            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            try:
+                page.goto(CANVAS + "/")
+            except PWError:
+                pass  # redirects to the NTU login page can abort the first navigation; that's fine
+            deadline = time.time() + 600
+            while True:
+                if not ctx.pages:
+                    raise closed
+                try:
+                    if ctx.request.get(CANVAS + "/api/v1/users/self").ok:
+                        break
+                except PWError:
+                    if not ctx.pages:
+                        raise closed
+                if time.time() > deadline:
+                    raise UserError("登入逾時（10 分鐘）。Login timed out.")
+                time.sleep(1.5)
+            cookies = [c for c in ctx.cookies() if c["domain"].lstrip(".").endswith("cool.ntu.edu.tw")]
+        except PWError as e:
+            if not ctx.pages:
+                raise closed
+            raise UserError(f"登入時瀏覽器發生錯誤 / Browser error during login: {e}")
+        finally:
+            try:
+                ctx.close()
+            except PWError:
+                pass
+    return cookies
+
 
 
 # ---------- NTU COOL (Canvas) API ----------
 
 class Canvas:
-    def __init__(self, token):
+    def __init__(self, token=None, cookies=None):
         self.s = requests.Session()
-        self.s.headers.update({"Authorization": f"Bearer {token}", "User-Agent": UA})
+        self.s.headers.update({"User-Agent": UA, "Accept": "application/json"})
+        if token:
+            self.s.headers["Authorization"] = f"Bearer {token}"
+        for c in cookies or []:
+            self.s.cookies.set(c["name"], c["value"], domain=c["domain"], path=c.get("path", "/"))
+
+    @staticmethod
+    def parse(r):
+        # Canvas prefixes JSON with "while(1);" when the request is authenticated by cookie.
+        return json.loads(r.text.removeprefix("while(1);"))
 
     def get(self, path, **params):
         try:
@@ -86,7 +144,7 @@ class Canvas:
         except requests.ConnectionError:
             raise UserError("連不到 NTU COOL，請檢查網路。Cannot reach NTU COOL; check your connection.")
         if r.status_code == 401:
-            raise UserError("權杖無效或已過期。The token is invalid or expired.")
+            raise AuthError("登入已失效。Not logged in or the login expired.")
         if r.status_code in (403, 404):
             raise UserError(f"沒有權限或找不到：{path}（你有修這門課嗎？）"
                             f" Not found / no access (are you enrolled in this course?)")
@@ -95,14 +153,14 @@ class Canvas:
 
     def paged(self, path, **params):
         r = self.get(path, per_page=100, **params)
-        out = r.json()
+        out = self.parse(r)
         while "next" in r.links:
             r = self.get(r.links["next"]["url"])
-            out += r.json()
+            out += self.parse(r)
         return out
 
     def me(self):
-        return self.get("/api/v1/users/self").json()
+        return self.parse(self.get("/api/v1/users/self"))
 
     def video_items(self, course_id, item_id=None):
         """Return [(module_name, module_item)] for cool-video items."""
@@ -122,7 +180,8 @@ class Canvas:
 
     def launch_form(self, course_id, item_id):
         url = self.get(f"/api/v1/courses/{course_id}/external_tools/sessionless_launch",
-                       launch_type="module_item", module_item_id=item_id).json()["url"]
+                       launch_type="module_item", module_item_id=item_id)
+        url = self.parse(url)["url"]
         # The verifier in the URL authenticates this request; no cookies needed.
         page = requests.get(url, headers={"User-Agent": UA}, timeout=30).text
         p = FormParser()
@@ -209,6 +268,31 @@ def download_dash(mpd_url, dest):
     subprocess.run(cmd, check=True)
 
 
+RETRIES = 5
+
+
+def download_video(canvas, course_id, item_id, dest):
+    """Download one video, resuming automatically if the connection drops."""
+    for attempt in range(1, RETRIES + 1):
+        try:
+            info = video_info(canvas, course_id, item_id)  # fresh link each try (links expire)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if attempt == 1:
+                print(f"  -> {dest}")
+            if info.get("altSourceUri"):
+                download_http(info["altSourceUri"], dest)
+            elif info.get("sourceUri"):
+                download_dash(info["sourceUri"], dest)
+            else:
+                raise UserError("找不到影片來源 / video has no source")
+            return
+        except (requests.ConnectionError, requests.Timeout, requests.exceptions.ChunkedEncodingError) as e:
+            print(f"\n  連線中斷，{attempt}/{RETRIES} 次重試中... Connection dropped, retrying ({attempt}/{RETRIES})")
+            if attempt == RETRIES:
+                raise UserError(f"網路一直中斷，請稍後再執行一次（會接續下載）。Network kept failing; run again later to resume. ({e})")
+            time.sleep(3 * attempt)
+
+
 # ---------- helpers ----------
 
 def safe_name(s):
@@ -251,30 +335,24 @@ def default_outdir():
 # ---------- main ----------
 
 def run(args, interactive):
-    token = args.token or saved_token()
-    newly_entered = False
-    if not token:
-        if not interactive:
-            raise UserError("No token. Run without arguments once to set it up, or pass --token.")
-        token = ask_token()
-        newly_entered = True
-    canvas = Canvas(token)
-    try:
+    token = args.token or os.environ.get("NTU_COOL_TOKEN")
+    if token:  # advanced: an access token, if you have one
+        canvas = Canvas(token=token)
         me = canvas.me()
-    except UserError:
-        if newly_entered or args.token:
-            raise
-        # Saved token stopped working: ask for a new one.
-        print("已儲存的權杖失效了。The saved token no longer works.")
-        if not interactive:
-            raise
-        token = ask_token()
-        newly_entered = True
-        canvas = Canvas(token)
-        me = canvas.me()
-    if newly_entered and not args.token:
-        save_token(token)
-        print(f"權杖已儲存於 / Token saved to {token_file()}")
+    else:
+        canvas, me = None, None
+        cookies = saved_cookies()
+        if cookies:
+            canvas = Canvas(cookies=cookies)
+            try:
+                me = canvas.me()
+            except AuthError:
+                print("登入已過期，需要重新登入。Your login expired; please sign in again.")
+        if me is None:
+            cookies = browser_login()
+            canvas = Canvas(cookies=cookies)
+            me = canvas.me()
+            save_cookies(cookies)
     print(f"登入身分 / Logged in as: {me.get('name')}")
 
     urls = args.urls
@@ -290,7 +368,7 @@ def run(args, interactive):
     failures = 0
     for u in urls:
         course_id, item_id = parse_url(u)
-        course = canvas.get(f"/api/v1/courses/{course_id}").json()
+        course = canvas.parse(canvas.get(f"/api/v1/courses/{course_id}"))
         items = canvas.video_items(course_id, item_id)
         print(f"\n[{course.get('name', course_id)}] 找到 {len(items)} 部影片 / video(s)")
         if not items:
@@ -317,15 +395,7 @@ def run(args, interactive):
                 print("  已下載過，略過 / already downloaded, skipping")
                 continue
             try:
-                info = video_info(canvas, course_id, it["id"])
-                outdir.mkdir(parents=True, exist_ok=True)
-                print(f"  -> {dest}")
-                if info.get("altSourceUri"):
-                    download_http(info["altSourceUri"], dest)
-                elif info.get("sourceUri"):
-                    download_dash(info["sourceUri"], dest)
-                else:
-                    raise UserError("找不到影片來源 / video has no source")
+                download_video(canvas, course_id, it["id"], dest)
             except KeyboardInterrupt:
                 raise
             except Exception as e:
@@ -345,16 +415,17 @@ def main():
     ap = argparse.ArgumentParser(prog="ntu_cool_dl", description="Download NTU COOL lecture videos.")
     ap.add_argument("urls", nargs="*", help="course link or video link (omit for interactive mode)")
     ap.add_argument("-o", "--outdir", help="output folder (default: Downloads/NTU COOL Videos)")
-    ap.add_argument("--token", help="NTU COOL access token (otherwise the saved one is used)")
+    ap.add_argument("--token", help="use an NTU COOL access token instead of logging in")
     ap.add_argument("--list", action="store_true", help="only list videos, don't download")
     ap.add_argument("--all", action="store_true", help="download every video without asking")
-    ap.add_argument("--forget-token", action="store_true", help="delete the saved token and exit")
+    ap.add_argument("--logout", action="store_true", help="forget the saved login and exit")
     ap.add_argument("--version", action="version", version=__version__)
     args = ap.parse_args()
 
-    if args.forget_token:
-        token_file().unlink(missing_ok=True)
-        print("已刪除儲存的權杖。Saved token deleted.")
+    if args.logout:
+        cookies_file().unlink(missing_ok=True)
+        shutil.rmtree(config_dir() / "browser", ignore_errors=True)
+        print("已登出，儲存的登入資料已刪除。Logged out; saved login deleted.")
         return
 
     interactive = not args.urls
